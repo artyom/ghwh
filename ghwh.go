@@ -29,9 +29,7 @@ func main() {
 		Addr:  "127.0.0.1:8080",
 		Qsize: 10,
 	}
-	if err := autoflags.Define(&config); err != nil {
-		log.Fatal(err)
-	}
+	autoflags.Define(&config)
 	flag.Parse()
 	cfg, err := readConfig(config.Config)
 	if err != nil {
