@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/artyom/autoflags"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func main() {
