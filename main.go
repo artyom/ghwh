@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"time"
 
@@ -20,14 +22,17 @@ import (
 
 func main() {
 	config := struct {
-		Addr     string `flag:"listen,address to listen at"`
-		Qsize    int    `flag:"qsize,job queue size"`
-		Config   string `flag:"config,path to config (yaml)"`
-		CertFile string `flag:"cert,path to ssl certificate"`
-		KeyFile  string `flag:"key,path to ssl certificate key"`
+		Addr     string        `flag:"listen,address to listen at"`
+		Qsize    int           `flag:"qsize,job queue size"`
+		Config   string        `flag:"config,path to config (yaml)"`
+		CertFile string        `flag:"cert,path to ssl certificate"`
+		KeyFile  string        `flag:"key,path to ssl certificate key"`
+		Timeout  time.Duration `flag:"timeout,timeout for command run"`
+		Verbose  bool          `flag:"verbose,pass stdout/stderr from commands to stderr"`
 	}{
-		Addr:  "127.0.0.1:8080",
-		Qsize: 10,
+		Addr:    "127.0.0.1:8080",
+		Qsize:   10,
+		Timeout: 3 * time.Minute,
 	}
 	autoflags.Define(&config)
 	flag.Parse()
@@ -38,7 +43,11 @@ func main() {
 	if config.Qsize < 1 {
 		config.Qsize = 1
 	}
-	h := hookHandler{cmds: make(chan execEnv, config.Qsize)}
+	h := hookHandler{
+		cmds:    make(chan execEnv, config.Qsize),
+		timeout: config.Timeout,
+		verbose: config.Verbose,
+	}
 	for k, v := range cfg {
 		http.HandleFunc(k, h.endpointHandler(v))
 	}
@@ -58,41 +67,49 @@ func main() {
 // hookHandler manages receiving/dispatching hook requests and running
 // corresponding commands
 type hookHandler struct {
-	cmds chan execEnv
+	cmds    chan execEnv
+	timeout time.Duration
+	verbose bool
 }
 
 // run receives commands to run on channel and executes them
 func (hh hookHandler) run() {
-	for item := range hh.cmds {
+	cmdRun := func(item execEnv) error {
+		ctx := context.Background()
+		if hh.timeout > 0 {
+			var cancel func()
+			ctx, cancel = context.WithTimeout(ctx, hh.timeout)
+			defer cancel()
+		}
 		var cmd *exec.Cmd
 		c, ok := item.endpoint.Refs[item.payload.Ref]
 		switch {
 		case ok:
 			log.Print("found per-ref command")
-			cmd = exec.Command(c.Command, c.Args...)
+			cmd = exec.CommandContext(ctx, c.Command, c.Args...)
 		case !ok && len(item.endpoint.Command) > 0:
 			log.Print("found global per-repo command")
-			cmd = exec.Command(
+			cmd = exec.CommandContext(ctx,
 				item.endpoint.Command,
 				item.endpoint.Args...)
 		default:
 			log.Printf("no matching command for ref %q found, skipping",
 				item.payload.Ref)
-			continue
+			return nil
 		}
 		log.Printf("repo: %q, ref: %q, command: %v",
 			item.endpoint.RepoName, item.payload.Ref, cmd.Args)
-		if err := cmd.Start(); err != nil {
-			log.Print("failed to start command:", err)
-			continue
+		if hh.verbose {
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
 		}
-		go func(cmd *exec.Cmd) {
-			if err := cmd.Wait(); err != nil {
-				log.Print("command finished with error:", err)
-				return
-			}
-			log.Print("command finished ok")
-		}(cmd)
+		return cmd.Run()
+	}
+	for item := range hh.cmds {
+		if err := cmdRun(item); err != nil {
+			log.Printf("repo: %q, ref: %q, command run: %v",
+				item.endpoint.RepoName, item.payload.Ref, err)
+		}
 	}
 }
 
